@@ -1,26 +1,281 @@
-const { Client, GatewayIntentBits } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  PermissionsBitField,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  Events,
+  Collection,
+} = require('discord.js');
+
+const prefix = '?';
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
   ],
+  partials: [Partials.Channel],
 });
+
+client.commands = new Collection();
+
+const tickets = new Map(); // userId -> channelId
+const giveaways = new Map(); // giveawayId -> giveawayData (simplified)
 
 client.once('ready', () => {
   console.log(`Bluey is online as ${client.user.tag}!`);
+  client.user.setActivity('blueMM', { type: 'WATCHING' });
 });
 
-client.on('messageCreate', (message) => {
-  if (message.author.bot) return;
+// ===== COMMAND HANDLER =====
+client.on('messageCreate', async (message) => {
+  if (message.author.bot || !message.guild) return;
+  if (!message.content.startsWith(prefix)) return;
 
-  if (message.content.toLowerCase() === '!ping') {
-    message.channel.send('Pong!');
+  const args = message.content.slice(prefix.length).trim().split(/ +/);
+  const cmd = args.shift().toLowerCase();
+
+  // === TICKET SYSTEM ===
+  if (cmd === 'ticket') {
+    if (tickets.has(message.author.id)) {
+      return message.reply('You already have a ticket open!');
+    }
+
+    let ticketChannel = await message.guild.channels.create({
+      name: `ticket-${message.author.username}`,
+      type: 0,
+      permissionOverwrites: [
+        {
+          id: message.guild.roles.everyone.id,
+          deny: [PermissionsBitField.Flags.ViewChannel],
+        },
+        {
+          id: message.author.id,
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.ReadMessageHistory,
+          ],
+        },
+        {
+          id: client.user.id,
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.ReadMessageHistory,
+          ],
+        },
+      ],
+    });
+
+    tickets.set(message.author.id, ticketChannel.id);
+
+    const embed = new EmbedBuilder()
+      .setTitle('Ticket Opened')
+      .setDescription(`Hello ${message.author}, please describe your issue.`)
+      .setColor('Blue');
+
+    const closeButton = new ButtonBuilder()
+      .setCustomId('close_ticket')
+      .setLabel('Close Ticket')
+      .setStyle(ButtonStyle.Danger);
+
+    const row = new ActionRowBuilder().addComponents(closeButton);
+
+    ticketChannel.send({ embeds: [embed], components: [row] });
+
+    message.reply(`Your ticket has been created: ${ticketChannel}`);
+    return;
   }
 
-  if (message.content.toLowerCase() === '!name') {
-    message.channel.send('My name is Bluey!');
+  // === CLOSE TICKET COMMAND (in channel) ===
+  if (cmd === 'close') {
+    if (!message.channel.name.startsWith('ticket-'))
+      return message.reply('You can only close tickets in ticket channels.');
+
+    if (
+      !message.member.permissions.has(PermissionsBitField.Flags.ManageChannels) &&
+      message.channel.name !== `ticket-${message.author.username}`
+    )
+      return message.reply('Only the ticket owner or staff can close the ticket.');
+
+    tickets.forEach((chanId, userId) => {
+      if (chanId === message.channel.id) tickets.delete(userId);
+    });
+
+    await message.channel.delete();
+    return;
+  }
+
+  // === BAN COMMAND ===
+  if (cmd === 'ban') {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+      return message.reply('You do not have permission to ban.');
+
+    const user = message.mentions.users.first();
+    if (!user) return message.reply('Please mention a user to ban.');
+
+    const member = message.guild.members.cache.get(user.id);
+    if (!member) return message.reply('User not found.');
+
+    const reason = args.slice(1).join(' ') || 'No reason provided';
+
+    try {
+      await member.ban({ reason });
+      message.channel.send(`${user.tag} was banned. Reason: ${reason}`);
+    } catch {
+      message.reply('Could not ban that user.');
+    }
+    return;
+  }
+
+  // === KICK COMMAND ===
+  if (cmd === 'kick') {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.KickMembers))
+      return message.reply('You do not have permission to kick.');
+
+    const user = message.mentions.users.first();
+    if (!user) return message.reply('Please mention a user to kick.');
+
+    const member = message.guild.members.cache.get(user.id);
+    if (!member) return message.reply('User not found.');
+
+    const reason = args.slice(1).join(' ') || 'No reason provided';
+
+    try {
+      await member.kick(reason);
+      message.channel.send(`${user.tag} was kicked. Reason: ${reason}`);
+    } catch {
+      message.reply('Could not kick that user.');
+    }
+    return;
+  }
+
+  // === GIVEAWAY COMMAND (simple) ===
+  if (cmd === 'giveaway') {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.ManageGuild))
+      return message.reply('You do not have permission to start giveaways.');
+
+    const duration = args[0];
+    const prize = args.slice(1).join(' ');
+
+    if (!duration || !prize)
+      return message.reply('Usage: ?giveaway <duration (s/m/h)> <prize>');
+
+    // Simple giveaway message with a button to enter
+    const embed = new EmbedBuilder()
+      .setTitle('🎉 Giveaway 🎉')
+      .setDescription(`Prize: **${prize}**\nDuration: ${duration}`)
+      .setColor('Gold')
+      .setTimestamp(Date.now() + parseDuration(duration));
+
+    const enterButton = new ButtonBuilder()
+      .setCustomId('giveaway_enter')
+      .setLabel('Enter Giveaway')
+      .setStyle(ButtonStyle.Primary);
+
+    const row = new ActionRowBuilder().addComponents(enterButton);
+
+    const giveawayMessage = await message.channel.send({ embeds: [embed], components: [row] });
+
+    giveaways.set(giveawayMessage.id, {
+      prize,
+      endsAt: Date.now() + parseDuration(duration),
+      entries: new Set(),
+      message: giveawayMessage,
+      channel: message.channel,
+    });
+
+    setTimeout(() => endGiveaway(giveawayMessage.id), parseDuration(duration));
+
+    return;
+  }
+
+  // === EMBED COMMAND ===
+  if (cmd === 'embed') {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.ManageMessages))
+      return message.reply('You do not have permission to send embeds.');
+
+    const embedMessage = args.join(' ');
+    if (!embedMessage) return message.reply('Please provide a message for the embed.');
+
+    const embed = new EmbedBuilder()
+      .setDescription(embedMessage)
+      .setColor('Random')
+      .setTimestamp();
+
+    message.channel.send({ embeds: [embed] });
+    return;
   }
 });
+
+// Button interactions (ticket close, giveaway enter)
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton()) return;
+
+  // Close ticket button
+  if (interaction.customId === 'close_ticket') {
+    if (!interaction.channel.name.startsWith('ticket-'))
+      return interaction.reply({ content: 'This is not a ticket channel.', ephemeral: true });
+
+    tickets.forEach((chanId, userId) => {
+      if (chanId === interaction.channel.id) tickets.delete(userId);
+    });
+
+    await interaction.channel.delete();
+    return;
+  }
+
+  // Giveaway enter button
+  if (interaction.customId === 'giveaway_enter') {
+    const giveaway = giveaways.get(interaction.message.id);
+    if (!giveaway) return interaction.reply({ content: 'Giveaway not found.', ephemeral: true });
+
+    if (giveaway.entries.has(interaction.user.id))
+      return interaction.reply({ content: 'You already entered!', ephemeral: true });
+
+    giveaway.entries.add(interaction.user.id);
+    interaction.reply({ content: 'You entered the giveaway!', ephemeral: true });
+  }
+});
+
+// Helper to parse giveaway duration string
+function parseDuration(str) {
+  const num = parseInt(str.slice(0, -1));
+  const unit = str.slice(-1);
+  if (unit === 's') return num * 1000;
+  if (unit === 'm') return num * 60 * 1000;
+  if (unit === 'h') return num * 60 * 60 * 1000;
+  return 0;
+}
+
+// End giveaway and pick random winner
+async function endGiveaway(messageId) {
+  const giveaway = giveaways.get(messageId);
+  if (!giveaway) return;
+
+  if (giveaway.entries.size === 0) {
+    giveaway.channel.send('Giveaway ended: no entries.');
+    giveaways.delete(messageId);
+    return;
+  }
+
+  const winnerId = Array.from(giveaway.entries)[
+    Math.floor(Math.random() * giveaway.entries.size)
+  ];
+
+  const winner = await giveaway.channel.guild.members.fetch(winnerId);
+
+  giveaway.channel.send(
+    `🎉 Giveaway ended! Congratulations ${winner.user.tag}, you won **${giveaway.prize}**!`
+  );
+
+  giveaways.delete(messageId);
+}
 
 client.login(process.env.TOKEN);
